@@ -1,0 +1,528 @@
+Fake News + Bot Detection — Completed Project
+This document contains a finished, runnable prototype of the Fake News + Bot Detection starter repo you uploaded. The repo is small, self-contained, and uses simple heuristics for the models so you can run it locally without heavy ML dependencies. Replace the heuristic models with real ML models when you want production accuracy.
+________________________________________
+Below are the project files. Create the directory structure and copy each file’s contents into the corresponding path.
+fake-news-starter/
+├── backend/
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── main.py
+│   │   ├── auth.py
+│   │   ├── db.py
+│   │   ├── models.py
+│   │   ├── schemas.py
+│   │   ├── model_utils.py
+│   │   ├── bot_model_utils.py
+│   ├── Dockerfile
+│   └── requirements.txt
+├── dashboard/
+│   └── streamlit_app.py
+├── docker-compose.yml
+├── docker-compose.override.yml
+└── README.md
+________________________________________
+backend/app/init.py
+# empty — marks package
+backend/app/db.py
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./test.db")
+
+engine = create_engine(
+    DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Dependency
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+backend/app/models.py
+from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, Text
+from sqlalchemy.sql import func
+from .db import Base
+
+class DetectionLog(Base):
+    __tablename__ = "detection_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    detection_type = Column(String(50))  # 'fake_news' or 'bot'
+    input_text = Column(Text)
+    fake_probability = Column(Float)
+    explanation = Column(Text)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Optional account metadata
+    followers = Column(Integer, nullable=True)
+    following = Column(Integer, nullable=True)
+    posts = Column(Integer, nullable=True)
+    verified = Column(Boolean, nullable=True)
+    account_age_days = Column(Integer, nullable=True)
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(64), unique=True, index=True, nullable=False)
+    hashed_password = Column(String(256), nullable=False)
+    is_active = Column(Boolean, default=True)
+backend/app/schemas.py
+from pydantic import BaseModel
+from typing import Optional, Any
+
+class TextRequest(BaseModel):
+    text: str
+
+class AccountRequest(BaseModel):
+    bio: Optional[str] = ""
+    followers: Optional[int] = 0
+    following: Optional[int] = 0
+    posts: Optional[int] = 0
+    verified: Optional[bool] = False
+    account_age_days: Optional[int] = 0
+
+class ScoreResponse(BaseModel):
+    fake_probability: float
+    explanation: Any
+backend/app/auth.py
+import os
+from datetime import datetime, timedelta
+from typing import Optional
+
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy.orm import Session
+
+from .db import get_db
+from .models import User
+
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
+
+# Password helpers
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+# User helpers
+
+def get_user(db: Session, username: str) -> Optional[User]:
+    return db.query(User).filter(User.username == username).first()
+
+
+def authenticate_user(db: Session, username: str, password: str):
+    user = get_user(db, username)
+    if not user:
+        return False
+    if not verify_password(password, user.hashed_password):
+        return False
+    return user
+
+# Token helpers
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = get_user(db, username=username)
+    if user is None:
+        raise credentials_exception
+    return user
+backend/app/model_utils.py
+# Lightweight heuristic 'fake-news' scorer for prototype
+
+from typing import Tuple, Any
+import math
+
+def _sigmoid(x: float) -> float:
+    return 1 / (1 + math.exp(-x))
+
+
+def load_model():
+    """Return a dummy model object (here just a placeholder)"""
+    return {}
+
+
+def score_text(model, text: str) -> Tuple[float, Any]:
+    """
+    Heuristic scoring:
+      - longer text -> less likely fake (lower prob)
+      - presence of suspicious tokens (http, click, shocking words) increases probability
+    Returns (probability, explanation_dict)
+    """
+    t = text or ""
+    length = len(t)
+    suspicious_tokens = ["http", "bit.ly", "click", "shocking", "unbelievable", "miracle", "buy now"]
+    hits = sum(1 for s in suspicious_tokens if s in t.lower())
+    score_raw = (hits * 1.5) + (50 / (length + 1)) - (length / 1000)
+    prob = max(0.0, min(1.0, _sigmoid(score_raw)))
+    explanation = {
+        "length": length,
+        "suspicious_token_hits": hits,
+        "rule_score": score_raw,
+    }
+    return prob, explanation
+backend/app/bot_model_utils.py
+# Lightweight heuristic 'bot account' scorer
+from typing import Tuple, Any
+import math
+
+def _sigmoid(x: float) -> float:
+    return 1 / (1 + math.exp(-x))
+
+
+def load_bot_model():
+    return {}
+
+
+def score_account(model, account: dict) -> Tuple[float, Any]:
+    """
+    Heuristic:
+      - very low followers + high following => bot-like
+      - many posts in short account age => bot-like
+      - absent bio => bot-like
+    """
+    followers = account.get("followers", 0) or 0
+    following = account.get("following", 0) or 0
+    posts = account.get("posts", 0) or 0
+    verified = bool(account.get("verified", False))
+    age = account.get("account_age_days", 0) or 0
+    bio = (account.get("bio") or "").strip()
+
+    score = 0.0
+    # follower-following ratio
+    if followers == 0:
+        score += 2.0
+    else:
+        ratio = following / max(1, followers)
+        if ratio > 5:
+            score += 1.5
+        elif ratio > 2:
+            score += 0.8
+
+    # posting frequency heuristic
+    if age > 0:
+        posts_per_day = posts / age
+        if posts_per_day > 10:
+            score += 2.0
+        elif posts_per_day > 2:
+            score += 1.0
+
+    # empty bio
+    if not bio:
+        score += 1.0
+
+    # verified strongly reduces bot score
+    if verified:
+        score -= 2.0
+
+    prob = max(0.0, min(1.0, _sigmoid(score)))
+    explanation = {
+        "followers": followers,
+        "following": following,
+        "posts": posts,
+        "account_age_days": age,
+        "bio_present": bool(bio),
+        "verified": verified,
+        "rule_score": score,
+    }
+    return prob, explanation
+backend/app/main.py
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
+import json
+import os
+
+from .model_utils import load_model, score_text
+from .bot_model_utils import load_bot_model, score_account
+from .schemas import TextRequest, AccountRequest, ScoreResponse
+from .db import get_db, Base, engine
+from .models import DetectionLog, User
+from .auth import authenticate_user, create_access_token, get_current_user, get_password_hash
+
+app = FastAPI(title="FakeNews + BotDetection API")
+
+# Create DB tables automatically (for prototype)
+Base.metadata.create_all(bind=engine)
+
+# Create default admin user if not exists
+ADMIN_USER = os.getenv("ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "adminpass")
+
+
+def ensure_admin():
+    db = next(get_db())
+    user = db.query(User).filter(User.username == ADMIN_USER).first()
+    if not user:
+        hashed = get_password_hash(ADMIN_PASSWORD)
+        user = User(username=ADMIN_USER, hashed_password=hashed, is_active=True)
+        db.add(user)
+        db.commit()
+    db.close()
+
+ensure_admin()
+
+model = load_model()
+bot_model = load_bot_model()
+
+
+@app.post("/token")
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(status_code=400, detail="Incorrect username or password")
+    access_token = create_access_token(data={"sub": user.username})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@app.post("/score", response_model=ScoreResponse)
+async def score(req: TextRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    try:
+        prob, explanation = score_text(model, req.text)
+        log = DetectionLog(
+            detection_type="fake_news",
+            input_text=req.text,
+            fake_probability=prob,
+            explanation=json.dumps(explanation),
+        )
+        db.add(log)
+        db.commit()
+        return ScoreResponse(fake_probability=prob, explanation=explanation)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/score_account", response_model=ScoreResponse)
+async def score_account_endpoint(req: AccountRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    try:
+        prob, explanation = score_account(bot_model, req.dict())
+        log = DetectionLog(
+            detection_type="bot",
+            input_text=req.bio,
+            fake_probability=prob,
+            explanation=json.dumps(explanation),
+            followers=req.followers,
+            following=req.following,
+            posts=req.posts,
+            verified=req.verified,
+            account_age_days=req.account_age_days,
+        )
+        db.add(log)
+        db.commit()
+        return ScoreResponse(fake_probability=prob, explanation=explanation)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/history")
+async def get_history(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    logs = db.query(DetectionLog).order_by(DetectionLog.id.desc()).limit(20).all()
+    return [
+        {"id": l.id, "type": l.detection_type, "prob": l.fake_probability, "timestamp": l.timestamp}
+        for l in logs
+    ]
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+backend/requirements.txt
+fastapi==0.95.2
+uvicorn[standard]==0.22.0
+SQLAlchemy==1.4.50
+psycopg2-binary==2.9.6
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.6
+requests==2.31.0
+streamlit==1.26.0
+Note: Versions are suggestions. Adjust as needed.
+backend/Dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY ./app /app/app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+dashboard/streamlit_app.py
+import streamlit as st
+import requests
+import os
+
+API_BASE = os.getenv("API_BASE", "http://localhost:8000")
+
+st.title("Fake News + Bot Detection — Dashboard")
+
+if "token" not in st.session_state:
+    st.session_state["token"] = None
+
+st.sidebar.subheader("Login")
+username = st.sidebar.text_input("Username")
+password = st.sidebar.text_input("Password", type="password")
+if st.sidebar.button("Login"):
+    resp = requests.post(f"{API_BASE}/token", data={"username": username, "password": password})
+    if resp.status_code == 200:
+        st.session_state["token"] = resp.json()["access_token"]
+        st.sidebar.success("Logged in")
+    else:
+        st.sidebar.error("Login failed")
+
+headers = {"Authorization": f"Bearer {st.session_state['token']}"} if st.session_state.get("token") else {}
+
+st.header("Check news text")
+text = st.text_area("Paste text to check")
+if st.button("Score text"):
+    if not headers:
+        st.error("Please login first in the sidebar")
+    else:
+        resp = requests.post(f"{API_BASE}/score", json={"text": text}, headers=headers)
+        if resp.status_code == 200:
+            data = resp.json()
+            st.write("Fake probability:", data["fake_probability"])
+            st.json(data["explanation"])
+        else:
+            st.error(f"Error: {resp.status_code} — {resp.text}")
+
+st.header("Check account")
+with st.form("account_form"):
+    bio = st.text_area("Bio")
+    followers = st.number_input("Followers", min_value=0, value=0)
+    following = st.number_input("Following", min_value=0, value=0)
+    posts = st.number_input("Posts", min_value=0, value=0)
+    verified = st.checkbox("Verified")
+    account_age_days = st.number_input("Account age (days)", min_value=0, value=0)
+    submitted = st.form_submit_button("Score account")
+    if submitted:
+        if not headers:
+            st.error("Please login first in the sidebar")
+        else:
+            payload = {
+                "bio": bio,
+                "followers": int(followers),
+                "following": int(following),
+                "posts": int(posts),
+                "verified": bool(verified),
+                "account_age_days": int(account_age_days),
+            }
+            resp = requests.post(f"{API_BASE}/score_account", json=payload, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                st.write("Bot probability:", data["fake_probability"])
+                st.json(data["explanation"])
+            else:
+                st.error(f"Error: {resp.status_code} — {resp.text}")
+
+st.sidebar.markdown("---")
+st.sidebar.write("API base: ", API_BASE)
+docker-compose.yml
+version: '3.8'
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: fakenews
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg2://user:password@db:5432/fakenews
+      SECRET_KEY: "replace-with-secure-random"
+      ADMIN_USER: "admin"
+      ADMIN_PASSWORD: "change_me"
+      ACCESS_TOKEN_EXPIRE_MINUTES: "60"
+    depends_on:
+      - db
+    ports:
+      - "8000:8000"
+
+  dashboard:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - ./dashboard:/app
+    environment:
+      API_BASE: http://backend:8000
+    command: ["bash", "-lc", "pip install streamlit requests && streamlit run streamlit_app.py --server.port 8501 --server.address 0.0.0.0"]
+    ports:
+      - "8501:8501"
+    depends_on:
+      - backend
+
+volumes:
+  db-data:
+docker-compose.override.yml (local testing helper)
+version: '3.8'
+services:
+  backend:
+    environment:
+      SECRET_KEY: "dev-secret-key-for-local"
+      ADMIN_PASSWORD: "adminpass"
+  dashboard:
+    environment:
+      API_BASE: http://localhost:8000
+README.md
+# Fake News + Bot Detection — Completed Prototype
+
+This repo is a runnable prototype. It includes a FastAPI backend (with JWT auth) and a Streamlit dashboard.
+
+## Quick start (local, using Docker Compose)
+
+1. Copy files into the directory structure shown in this document.
+2. Start services:
+
+```bash
+docker-compose up --build
+3.	Open dashboard: http://localhost:8501
+4.	Default admin credentials (from docker-compose):
+o	username: admin
+o	password: change_me
+5.	Example curl to get token:
+curl -X POST -F "username=admin" -F "password=change_me" http://localhost:8000/token
+6.	Example score (replace  from previous call):
+curl -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" -d '{"text":"Breaking news! Click now http://bit.ly/xyz"}' http://localhost:8000/score
+Notes
+•	The models included are heuristics for local testing. Replace model_utils.py and bot_model_utils.py with real ML models for production.
+•	Change SECRET_KEY and admin password before exposing to the internet.
+•	Use HTTPS and a proper identity provider for production. ```
+________________________________________
+That’s the finished project. Replace the heuristic scoring functions with real ML models if you want production-grade detection. If you’d like, I can (1) swap the heuristics for a small TF-IDF + logistic regression training script, (2) add Alembic migrations, or (3) containerize the Streamlit app separately. Tell me which of those you’d like next.
